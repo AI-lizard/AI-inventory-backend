@@ -19,16 +19,54 @@ from django.contrib import admin
 from django.urls import path, include
 from django.conf import settings
 from django.conf.urls.static import static
-from rest_framework.documentation import include_docs_urls
+from drf_yasg.views import get_schema_view
+from drf_yasg import openapi
+from rest_framework import permissions
+from django.views.generic import RedirectView
+from rest_framework.views import APIView
+from rest_framework.response import Response
 
+schema_view = get_schema_view(
+   openapi.Info(
+      title="Inventory API",
+      default_version='v1',
+   ),
+   public=True,
+   permission_classes=(permissions.AllowAny,),
+)
+
+# Optional: Add a basic health check endpoint
+class HealthCheckView(APIView):
+    def get(self, request):
+        return Response({"status": "healthy"})
+    
+class APIRootView(APIView):
+    permission_classes = [permissions.AllowAny]  # Allow anyone to see the API root
+    
+    def get(self, request):
+        return Response({
+            "message": "Welcome to the Inventory API",
+            "endpoints": {
+                "api": "/api/",
+                "admin": "/admin/",
+                "documentation": {
+                    "swagger": "/swagger/",
+                    "redoc": "/redoc/"
+                },
+                "health": "/health/"
+            }
+        })
+    
 urlpatterns = [
+    path('', APIRootView.as_view(), name='api-root'),
     path('admin/', admin.site.urls),
-    path('api/', include('inventory.urls')),  # Our inventory API endpoints
-    path('api-auth/', include('rest_framework.urls')),  # DRF authentication
-    path('docs/', include_docs_urls(title='Inventory API')),  # API documentation
+    path('api/', include('inventory.urls')),
+    path('api-auth/', include('rest_framework.urls')),
+    path('swagger/', schema_view.with_ui('swagger', cache_timeout=0)),
+    path('redoc/', schema_view.with_ui('redoc', cache_timeout=0)),
+    path('health/', HealthCheckView.as_view(), name='health-check'),
 ]
 
-# Serve media files in development
 if settings.DEBUG:
     urlpatterns += static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)
     urlpatterns += static(settings.STATIC_URL, document_root=settings.STATIC_ROOT)

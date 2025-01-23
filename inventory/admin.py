@@ -1,56 +1,113 @@
 from django.contrib import admin
-from .models import Category, Product, Supplier, Orders, OrderProduct, Usage, Notification, UsageProduct
+from django.db.models import Prefetch
+from .models import DrugCategory, Drug, Supplier, Order, OrderItem, DrugUsage, Notifications, PriceHistory
 
-class ProductAdmin(admin.ModelAdmin):
-    list_display = ('name', 'SKU', 'price', 'stock', 'category')
-    search_fields = ('name', 'SKU')
-    list_filter = ('category',)
+class DrugAdmin(admin.ModelAdmin):
+    list_display = ('name', 'generic_name', 'SKU', 'storage_count', 'loose_units', 'current_stock', 'category', 'expiry_date')
+    search_fields = ('name', 'generic_name', 'SKU')
+    list_filter = ('category', 'storage_unit', 'dispensing_unit')
     ordering = ('name',)
+    list_select_related = ('category',)
+    
     fieldsets = (
         (None, {
-            'fields': ('name', 'SKU', 'category')
+            'fields': ('name', 'generic_name', 'SKU', 'description', 'category')
         }),
-        ('Pricing and Stock', {
-            'fields': ('price', 'stock', 're_stock_level')
+        ('Unit Management', {
+            'fields': ('storage_unit', 'dispensing_unit', 'units_per_storage', 
+                      'storage_count', 'loose_units', 'reorder_level')
         }),
+        ('Pricing', {
+            'fields': ('purchase_price', 'selling_price')
+        }),
+        ('Dates', {
+            'fields': ('expiry_date',)
+        })
     )
+    readonly_fields = ('current_stock',)
 
-class OrderProductInline(admin.TabularInline):
-    model = OrderProduct
+    def get_queryset(self, request):
+        return super().get_queryset(request).select_related('category')
+
+class PriceHistoryInline(admin.TabularInline):
+    model = PriceHistory
+    extra = 0
+    readonly_fields = ('date_changed',)
+    can_delete = False
+    max_num = 10
+
+class OrderItemInline(admin.TabularInline):
+    model = OrderItem
     extra = 1
-    fields = ['product', 'quantity', 'price', 'value']
-    readonly_fields = ['value']
-
-class OrdersAdmin(admin.ModelAdmin):
-    list_display = ('id', 'supplier', 'total_value', 'order_date')
-    list_filter = ('supplier', 'order_date')
-    search_fields = ('supplier__name', 'order_products__product__name')
-    ordering = ('-order_date',)
-    inlines = [OrderProductInline]
-
-class UsageProductInline(admin.TabularInline):
-    model = UsageProduct
-    extra = 1
-    fields = ['product', 'quantity', 'value']
-    readonly_fields = ['value']
-
-class UsageAdmin(admin.ModelAdmin):
-    list_display = ('id', 'usage_type', 'date', 'total_value')
-    list_filter = ('usage_type', 'date')
-    search_fields = ('notes', 'usage_products__product__name')
-    ordering = ('-date',)
+    fields = ['drug', 'quantity', 'price_per_unit', 'total_value']
     readonly_fields = ['total_value']
-    inlines = [UsageProductInline]
+    autocomplete_fields = ['drug']
+    
+class OrderAdmin(admin.ModelAdmin):
+    list_display = ('id', 'supplier', 'status', 'total_value', 'order_date')
+    list_filter = ('status', 'order_date', 'supplier')
+    search_fields = ('supplier__name', 'items__drug__name')
+    ordering = ('-order_date',)
+    inlines = [OrderItemInline]
+    readonly_fields = ['total_value']
+    list_select_related = ('supplier',)
 
-class NotificationAdmin(admin.ModelAdmin):
-    list_display = ('notification_type', 'product', 'created_at', 'is_read')
+    def get_queryset(self, request):
+        return (
+            super()
+            .get_queryset(request)
+            .select_related('supplier')
+            .prefetch_related(
+                Prefetch(
+                    'items',
+                    queryset=OrderItem.objects.select_related('drug')
+                )
+            )
+        )
+
+class DrugUsageAdmin(admin.ModelAdmin):
+    list_display = ('drug', 'usage_type', 'quantity', 'total_value', 'date')
+    list_filter = ('usage_type', 'date')
+    search_fields = ('drug__name', 'notes')
+    ordering = ('-date',)
+    fields = ['drug', 'usage_type', 'quantity', 'unit_price', 'total_value', 'notes']
+    readonly_fields = ['total_value']
+    autocomplete_fields = ['drug']
+    list_select_related = ('drug',)
+
+    def get_queryset(self, request):
+        return super().get_queryset(request).select_related('drug')
+
+class NotificationsAdmin(admin.ModelAdmin):
+    list_display = ('drug', 'notification_type', 'created_at', 'is_read')
     list_filter = ('notification_type', 'is_read', 'created_at')
-    search_fields = ('product__name', 'message')
+    search_fields = ('drug__name', 'message')
     ordering = ('-created_at',)
+    readonly_fields = ['created_at']
+    list_select_related = ('drug',)
 
-admin.site.register(Category)
-admin.site.register(Product, ProductAdmin)
-admin.site.register(Supplier)
-admin.site.register(Orders, OrdersAdmin)
-admin.site.register(Usage, UsageAdmin)
-admin.site.register(Notification, NotificationAdmin)
+    def get_queryset(self, request):
+        return super().get_queryset(request).select_related('drug')
+
+class DrugCategoryAdmin(admin.ModelAdmin):
+    list_display = ('name', 'parent_category')
+    search_fields = ('name', 'description')
+    list_filter = ('parent_category',)
+    list_select_related = ('parent_category',)
+
+    def get_queryset(self, request):
+        return super().get_queryset(request).select_related('parent_category')
+
+class SupplierAdmin(admin.ModelAdmin):
+    list_display = ('name', 'contact_person', 'telephone', 'email')
+    search_fields = ('name', 'contact_person', 'email')
+    ordering = ('name',)
+
+# Register all models with optimized admin classes
+admin.site.register(DrugCategory, DrugCategoryAdmin)
+admin.site.register(Drug, DrugAdmin)
+admin.site.register(Supplier, SupplierAdmin)
+admin.site.register(Order, OrderAdmin)
+admin.site.register(DrugUsage, DrugUsageAdmin)
+admin.site.register(Notifications, NotificationsAdmin)
+admin.site.register(PriceHistory)  # Add this if you want to manage price history

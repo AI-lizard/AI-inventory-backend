@@ -12,10 +12,17 @@ https://docs.djangoproject.com/en/5.1/ref/settings/
 
 from pathlib import Path
 from datetime import timedelta
+import dj_database_url
+from django.db import connections
+from django.db.utils import OperationalError
+from dotenv import load_dotenv
+import os
+
+# Load environment variables from .env file
+load_dotenv()
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
-
 
 # Quick-start development settings - unsuitable for production
 # See https://docs.djangoproject.com/en/5.1/howto/deployment/checklist/
@@ -57,7 +64,7 @@ MIDDLEWARE = [
 
 # CORS settings
 CORS_ALLOWED_ORIGINS = [
-    "http://localhost:3000",
+    "http://localhost:3000", #next.js development
     "http://localhost:3001",
     "https://your-vercel-app-name.vercel.app",
 ]
@@ -118,17 +125,29 @@ WSGI_APPLICATION = "myapp.wsgi.application"
 # Database
 # https://docs.djangoproject.com/en/5.1/ref/settings/#databases
 
+def check_local_db():
+    """Check if the local database is accessible"""
+    try: 
+        db_conn = connections['default']
+        db_conn.cursor()
+        return True
+    except Exception as e:
+        print(f"Local database connection failed: {e}")
+        return False
+
 DATABASES = {
-    "default": {
-        "ENGINE": "django.db.backends.postgresql",
-        "NAME": "inventory",
-        "USER": "postgres",
-        "PASSWORD": "12345678",
-        "HOST": "localhost",
-        "PORT": "5432",
+    'default': {
+        'ENGINE': 'django.db.backends.postgresql',
+        'NAME': os.getenv('SUPABASE_DB'),
+        'USER': os.getenv('SUPABASE_USER'),
+        'PASSWORD': os.getenv('SUPABASE_PASSWORD'),
+        'HOST': os.getenv('SUPABASE_HOST'),
+        'PORT': '5432',
+        'OPTIONS': {
+            'sslmode': 'require',
+        }
     }
 }
-
 
 # Password validation
 # https://docs.djangoproject.com/en/5.1/ref/settings/#auth-password-validators

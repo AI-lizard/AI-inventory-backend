@@ -4,256 +4,228 @@ from decimal import Decimal
 from django.core.exceptions import ValidationError
 from django.core.mail import send_mail
 from django.conf import settings
-from django.contrib.auth.models import User
-from django.db.models.signals import post_save
-from django.dispatch import receiver
+from django.utils.timezone import now
 
-# Create your models here.
-
-class Category(models.Model):
+class DrugCategory(models.Model):
     name = models.CharField(max_length=100, unique=True)
     description = models.TextField(blank=True)
+    parent_category = models.ForeignKey(
+        'self',
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name='subcategories'
+    )
     
     class Meta:
-        verbose_name_plural = "Categories"
+        verbose_name_plural = "Drug Categories"
         
     def __str__(self):
         return self.name
 
-class Product(models.Model):
+class Drug(models.Model):
+    UNIT_TYPES = [
+        ('TABLET', 'Tablets'),
+        ('ML', 'Milliliters'),
+        ('BOX', 'Boxes'),
+        ('VIAL', 'Vials'),
+    ]
+
     name = models.CharField(max_length=200)
-    short_description = models.TextField()
-    price = models.DecimalField(
+    generic_name = models.CharField(max_length=200)
+    description = models.TextField()
+    category = models.ForeignKey(
+        DrugCategory, 
+        related_name='drugs',
+        on_delete=models.PROTECT
+    )
+    
+    # Unit management
+    storage_unit = models.CharField(max_length=10, choices=UNIT_TYPES, help_text="How you store it (Box, Vial)")
+    dispensing_unit = models.CharField(max_length=10, choices=UNIT_TYPES, help_text="How you dispense it (Tablet, ML)")
+    units_per_storage = models.PositiveIntegerField(help_text="e.g., 25 tablets per box, 5ml per vial")
+    storage_count = models.PositiveIntegerField(default=0, help_text="Number of full storage units")
+    loose_units = models.PositiveIntegerField(default=0, help_text="Remaining dispensing units")
+    reorder_level = models.PositiveIntegerField(default=10)
+
+    @property
+    def current_stock(self):
+        """Calculate total units dynamically."""
+        return (self.storage_count * self.units_per_storage) + self.loose_units
+
+    def dispense(self, amount):
+        """Dispense units while properly managing storage units"""
+        if amount > self.current_stock:
+            raise ValidationError(f"Insufficient stock. Only {self.current_stock} {self.dispensing_unit} available")
+        
+        remaining = self.current_stock - amount
+        self.storage_count = remaining // self.units_per_storage
+        self.loose_units = remaining % self.units_per_storage
+        self.save()
+
+    #Expiry management
+    @property
+    def is_expired(self):
+        """Check if the drug is expired."""
+        return self.expiry_date < now().date()
+
+    @classmethod
+    def check_expired_drugs(cls):
+        """Identify all expired drugs and create notifications."""
+        expired_drugs = cls.objects.filter(expiry_date__lt=now().date())
+        for drug in expired_drugs:
+            Notifications.objects.get_or_create(
+                drug=drug,
+                notification_type='EXPIRY',
+                defaults={
+                    'message': f"The drug {drug.name} has expired. Please take necessary actions."
+                }
+            )
+    
+    # Stock management
+    current_stock = models.PositiveIntegerField(default=0)
+    reorder_level = models.PositiveIntegerField(default=10)
+    
+    # Current pricing
+    purchase_price = models.DecimalField(
         max_digits=10, 
         decimal_places=2,
         validators=[MinValueValidator(Decimal('0.01'))]
     )
-    stock = models.PositiveIntegerField(default=0)
-    value = models.DecimalField(
+    selling_price = models.DecimalField(
         max_digits=10, 
-        decimal_places=2, 
-        editable=False
-    )  # Calculated field: price * stock
-    re_stock_level = models.PositiveIntegerField(default=10)
-    SKU = models.CharField(max_length=50, unique=True)
-    category = models.ForeignKey(
-        Category, 
-        related_name='products',
-        on_delete=models.PROTECT
+        decimal_places=2,
+        validators=[MinValueValidator(Decimal('0.01'))]
     )
+    
+    SKU = models.CharField(max_length=50, unique=True)
+    expiry_date = models.DateField()
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
-
-    def check_stock_level(self):
-        """Check if stock is at or below re_stock_level and create notification if needed"""
-        if self.stock <= self.re_stock_level:
-            # Create notification if one doesn't exist for this low stock event
-            if not Notification.objects.filter(
-                product=self,
-                notification_type='LOW_STOCK',
-                is_read=False
-            ).exists():
-                message = f"Product '{self.name}' stock is running low. Current stock: {self.stock}. Restock level: {self.re_stock_level}"
-                
-                # Create notification
-                notification = Notification.objects.create(
-                    product=self,
-                    notification_type='LOW_STOCK',
-                    message=message
-                )
-                
-                # Send email
-                send_mail(
-                    subject=f'Low Stock Alert - {self.name}',
-                    message=message,
-                    from_email=settings.EMAIL_HOST_USER,
-                    recipient_list=[settings.ADMIN_EMAIL],
-                    fail_silently=True,
-                )
-                
-                return notification
-        return None
-
-    def save(self, *args, **kwargs):
-        self.value = self.price * self.stock
-        super().save(*args, **kwargs)
-        self.check_stock_level()  # Check stock level after saving
 
     def __str__(self):
         return f"{self.name} ({self.SKU})"
 
+    def check_stock_level(self):
+        if self.current_stock <= self.reorder_level:
+            Notifications.objects.create_low_stock_alert(self)
+
+class PriceHistory(models.Model):
+    drug = models.ForeignKey(Drug, on_delete=models.CASCADE, related_name='price_history')
+    purchase_price = models.DecimalField(max_digits=10, decimal_places=2)
+    selling_price = models.DecimalField(max_digits=10, decimal_places=2)
+    date_changed = models.DateTimeField(auto_now_add=True)
+    
+    class Meta:
+        ordering = ['-date_changed']
+
 class Supplier(models.Model):
     name = models.CharField(max_length=200)
+    contact_person = models.CharField(max_length=100)
     telephone = models.CharField(max_length=20)
+    email = models.EmailField()
     address = models.TextField()
+    
     created_at = models.DateTimeField(auto_now_add=True)
 
     def __str__(self):
         return self.name
 
-class Orders(models.Model):
-    supplier = models.ForeignKey(
-        Supplier, 
-        related_name='orders',
-        on_delete=models.PROTECT
-    )
-    order_date = models.DateTimeField(auto_now_add=True)
-    total_value = models.DecimalField(
-        max_digits=10, 
-        decimal_places=2, 
-        default=0,
-        editable=False
-    )
-    products = models.ManyToManyField(
-        Product,
-        through='OrderProduct',
-        related_name='orders'
-    )
-
-    class Meta:
-        verbose_name_plural = "Orders"
-
-    def update_total_value(self):
-        self.total_value = sum(item.value for item in self.order_products.all())
-        self.save()
-
-    def __str__(self):
-        return f"Order {self.id} - {self.supplier.name}"
-
-class OrderProduct(models.Model):
-    order = models.ForeignKey(
-        Orders,
-        related_name='order_products',
-        on_delete=models.CASCADE
-    )
-    product = models.ForeignKey(
-        Product,
-        related_name='order_products',
-        on_delete=models.PROTECT
-    )
-    quantity = models.PositiveIntegerField(
-        validators=[MinValueValidator(1)]
-    )
-    price = models.DecimalField(
-        max_digits=10,
-        decimal_places=2,
-        validators=[MinValueValidator(Decimal('0.01'))]
-    )
-    value = models.DecimalField(
-        max_digits=10,
-        decimal_places=2,
-        editable=False
-    )
-
-    def save(self, *args, **kwargs):
-        self.value = self.price * self.quantity
-        
-        # Get the product's current stock before saving
-        if not self.pk:  # Only for new orders (not updates)
-            product = self.product
-            product.stock += self.quantity  # Add to stock since it's a purchase order
-            product.save()
-            
-        super().save(*args, **kwargs)
-        self.order.update_total_value()
-
-    def delete(self, *args, **kwargs):
-        # Revert stock changes when order item is deleted
-        self.product.stock -= self.quantity
-        self.product.save()
-        super().delete(*args, **kwargs)
-
-    def __str__(self):
-        return f"{self.product.name} - {self.quantity} units"
-    
-
-class Usage(models.Model):
-    USAGE_TYPES = [
-        ('VET', 'Veterinary Use'),
-        ('SALE', 'Sale to Owner')
+class Order(models.Model):
+    STATUS_CHOICES = [
+        ('ORDERED', 'Ordered'),
+        ('PENDING', 'Pending'),
+        ('RECEIVED', 'Received'),
+        ('CANCELLED', 'Cancelled'),
     ]
     
-    usage_type = models.CharField(max_length=4, choices=USAGE_TYPES, default='VET')
+    supplier = models.ForeignKey(Supplier, on_delete=models.PROTECT)
+    order_date = models.DateTimeField(auto_now_add=True)
+    status = models.CharField(max_length=10, choices=STATUS_CHOICES, default='PENDING')
+    total_value = models.DecimalField(max_digits=10, decimal_places=2, default=0)
+
+    def calculate_total_value(self):
+        """Recalculate the total value of the order."""
+        self.total_value = sum(item.total_value for item in self.items.all())
+        self.save()
+
+class OrderItem(models.Model):
+    order = models.ForeignKey(Order, related_name='items', on_delete=models.CASCADE)
+    drug = models.ForeignKey(Drug, on_delete=models.PROTECT)
+    quantity = models.PositiveIntegerField()
+    price_per_unit = models.DecimalField(max_digits=10, decimal_places=2)
+    
+    @property
+    def total_value(self):
+        """Calculate the total value for this item."""
+        return self.quantity * self.price_per_unit
+    
+    def save(self, *args, **kwargs):
+        super().save(*args, **kwargs)
+        self.order.calculate_total_value()
+        
+        # Update stock when order is received
+        if self.status == 'RECEIVED':
+            self.drug.current_stock += self.quantity
+            self.drug.save()
+
+class DrugUsage(models.Model):
+    USAGE_TYPES = [
+        ('SALE', 'Sale'),
+        ('EXPIRED', 'Expired'),
+        ('USED', 'Used'),
+        ('DAMAGE', 'Damage'),
+    ]
+    
+    drug = models.ForeignKey(Drug, on_delete=models.PROTECT)
+    usage_type = models.CharField(max_length=10, choices=USAGE_TYPES)
+    quantity = models.PositiveIntegerField()
+    unit_price = models.DecimalField(max_digits=10, decimal_places=2)
+    total_value = models.DecimalField(max_digits=10, decimal_places=2)
+    
     date = models.DateTimeField(auto_now_add=True)
     notes = models.TextField(blank=True)
-    total_value = models.DecimalField(
-        max_digits=10, 
-        decimal_places=2, 
-        default=0,
-        editable=False
-    )
-    products = models.ManyToManyField(
-        Product,
-        through='UsageProduct',
-        related_name='usage_sessions'
-    )
-
-    class Meta:
-        verbose_name_plural = "Usages"
-
-    def update_total_value(self):
-        self.total_value = sum(item.value for item in self.usage_products.all())
-        self.save()
-
-    def __str__(self):
-        return f"Usage {self.id} - {self.get_usage_type_display()} - {self.date}"
-
-class UsageProduct(models.Model):
-    usage = models.ForeignKey(
-        Usage,
-        related_name='usage_products',
-        on_delete=models.CASCADE
-    )
-    product = models.ForeignKey(
-        Product,
-        related_name='usage_products',
-        on_delete=models.PROTECT
-    )
-    quantity = models.PositiveIntegerField(
-        validators=[MinValueValidator(1)]
-    )
-    value = models.DecimalField(
-        max_digits=10,
-        decimal_places=2,
-        editable=False
-    )
-
+    
     def save(self, *args, **kwargs):
-        if not self.pk:  # Only for new usage records
-            if self.product.stock < self.quantity:
-                raise ValidationError(
-                    f"Insufficient stock for {self.product.name}. "
-                    f"Available: {self.product.stock}, Requested: {self.quantity}"
-                )
+        if self.drug.current_stock < self.quantity:
+            raise ValidationError(f"Insufficient stock. Available: {self.drug.current_stock}")
             
-            # Calculate value and update product stock
-            self.value = self.product.price * self.quantity
-            self.product.stock -= self.quantity
-            self.product.save()
-            
+        self.total_value = self.quantity * self.unit_price
+        self.drug.current_stock -= self.quantity
+        self.drug.save()
+        
         super().save(*args, **kwargs)
-        self.usage.update_total_value()
 
-    def delete(self, *args, **kwargs):
-        # Restore stock when usage product is deleted
-        self.product.stock += self.quantity
-        self.product.save()
-        super().delete(*args, **kwargs)
-
-    def __str__(self):
-        return f"{self.product.name} - {self.quantity} units"
-
-class Notification(models.Model):
+class Notifications(models.Model):
     NOTIFICATION_TYPES = [
         ('LOW_STOCK', 'Low Stock Alert'),
+        ('EXPIRY', 'Expiry Alert'),
     ]
     
-    product = models.ForeignKey(Product, on_delete=models.CASCADE, related_name='notifications')
+    drug = models.ForeignKey(Drug, on_delete=models.CASCADE)
     notification_type = models.CharField(max_length=20, choices=NOTIFICATION_TYPES)
     message = models.TextField()
     created_at = models.DateTimeField(auto_now_add=True)
     is_read = models.BooleanField(default=False)
     
-    def __str__(self):
-        return f"{self.notification_type} - {self.product.name}"
-
+    @classmethod
+    def create_low_stock_alert(cls, drug):
+        if not cls.objects.filter(
+            drug=drug,
+            notification_type='LOW_STOCK',
+            is_read=False
+        ).exists():
+            message = f"Low stock alert for {drug.name}. Current stock: {drug.current_stock}"
+            cls.objects.create(
+                drug=drug,
+                notification_type='LOW_STOCK',
+                message=message
+            )
+            # Send email notification
+            send_mail(
+                subject=f'Low Stock Alert - {drug.name}',
+                message=message,
+                from_email=settings.EMAIL_HOST_USER,
+                recipient_list=[settings.ADMIN_EMAIL],
+                fail_silently=True,
+            )

@@ -3,77 +3,91 @@ from rest_framework.decorators import action
 from rest_framework.response import Response
 from django_filters.rest_framework import DjangoFilterBackend
 from django.db.models import Q
-from datetime import datetime, timedelta
-from .models import Category, Product, Supplier, Orders, OrderProduct, Usage, Notification
+from django.utils.timezone import now
+from datetime import timedelta
+from .models import DrugCategory, Drug, Supplier, Order, OrderItem, DrugUsage, Notifications, PriceHistory
 from .serializers import (
-    CategorySerializer, ProductSerializer, SupplierSerializer, 
-    OrdersSerializer, OrderProductSerializer, UsageSerializer, NotificationSerializer, UsageProductSerializer
+    DrugCategorySerializer, DrugSerializer, SupplierSerializer,
+    OrderSerializer, OrderItemSerializer, DrugUsageSerializer,
+    NotificationsSerializer, PriceHistorySerializer
 )
 
-class CategoryViewSet(viewsets.ModelViewSet):
-    queryset = Category.objects.all()
-    serializer_class = CategorySerializer
+class DrugCategoryViewSet(viewsets.ModelViewSet):
+    queryset = DrugCategory.objects.all()
+    serializer_class = DrugCategorySerializer
     filter_backends = [filters.SearchFilter]
     search_fields = ['name', 'description']
 
     @action(detail=True, methods=['get'])
-    def products(self, request, pk=None):
+    def drugs(self, request, pk=None):
         category = self.get_object()
-        products = Product.objects.filter(category=category)
-        serializer = ProductSerializer(products, many=True)
+        drugs = Drug.objects.filter(category=category)
+        serializer = DrugSerializer(drugs, many=True)
         return Response(serializer.data)
 
-class ProductViewSet(viewsets.ModelViewSet):
-    queryset = Product.objects.all()
-    serializer_class = ProductSerializer
+class DrugViewSet(viewsets.ModelViewSet):
+    queryset = Drug.objects.all()
+    serializer_class = DrugSerializer
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
-    filterset_fields = ['category', 'stock']
-    search_fields = ['name', 'short_description', 'SKU']
-    ordering_fields = ['name', 'stock', 'price', 'created_at']
+    filterset_fields = ['category', 'storage_unit', 'dispensing_unit']
+    search_fields = ['name', 'generic_name', 'SKU', 'description']
+    ordering_fields = ['name', 'current_stock', 'expiry_date', 'created_at']
+
+    def get_queryset(self):
+        return Drug.objects.select_related('category').prefetch_related('price_history')
 
     @action(detail=False, methods=['get'])
     def low_stock(self, request):
-        products = Product.objects.filter(stock__lte=Q(re_stock_level))
-        serializer = self.get_serializer(products, many=True)
+        drugs = Drug.objects.filter(
+            Q(storage_count=0) & Q(loose_units=('reorder_level'))
+        )
+        
+        serializer = self.get_serializer(drugs, many=True)
         return Response(serializer.data)
 
     @action(detail=False, methods=['get'])
-    def out_of_stock(self, request):
-        products = Product.objects.filter(stock=0)
-        serializer = self.get_serializer(products, many=True)
+    def expired(self, request):
+        drugs = Drug.objects.filter(expiry_date__lt=now().date())
+        serializer = self.get_serializer(drugs, many=True)
+        return Response(serializer.data)
+
+    @action(detail=False, methods=['get'])
+    def expiring_soon(self, request):
+        threshold = now().date() + timedelta(days=30)
+        drugs = Drug.objects.filter(
+            expiry_date__gt=now().date(),
+            expiry_date__lte=threshold
+        )
+        serializer = self.get_serializer(drugs, many=True)
         return Response(serializer.data)
 
 class SupplierViewSet(viewsets.ModelViewSet):
     queryset = Supplier.objects.all()
     serializer_class = SupplierSerializer
     filter_backends = [filters.SearchFilter]
-    search_fields = ['name', 'telephone', 'address']
+    search_fields = ['name', 'contact_person', 'email', 'telephone']
 
     @action(detail=True, methods=['get'])
     def orders(self, request, pk=None):
         supplier = self.get_object()
-        orders = Orders.objects.filter(supplier=supplier)
-        serializer = OrdersSerializer(orders, many=True)
+        orders = Order.objects.filter(supplier=supplier)
+        serializer = OrderSerializer(orders, many=True)
         return Response(serializer.data)
 
-class OrdersViewSet(viewsets.ModelViewSet):
-    queryset = Orders.objects.all()
-    serializer_class = OrdersSerializer
+class OrderViewSet(viewsets.ModelViewSet):
+    queryset = Order.objects.all()
+    serializer_class = OrderSerializer
     filter_backends = [DjangoFilterBackend, filters.OrderingFilter]
     filterset_fields = ['supplier', 'status']
     ordering_fields = ['order_date', 'total_value']
 
-    def create(self, request, *args, **kwargs):
-        serializer = self.get_serializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
-        self.perform_create(serializer)
-        headers = self.get_success_headers(serializer.data)
-        return Response(serializer.data, status=status.HTTP_201_CREATED, headers=headers)
+    def get_queryset(self):
+        return Order.objects.select_related('supplier').prefetch_related('items__drug')
 
     @action(detail=False, methods=['get'])
     def recent(self, request):
-        recent_orders = Orders.objects.filter(
-            order_date__gte=datetime.now() - timedelta(days=30)
+        recent_orders = self.get_queryset().filter(
+            order_date__gte=now() - timedelta(days=30)
         ).order_by('-order_date')
         serializer = self.get_serializer(recent_orders, many=True)
         return Response(serializer.data)
@@ -81,30 +95,27 @@ class OrdersViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=['post'])
     def update_status(self, request, pk=None):
         order = self.get_object()
-        status = request.data.get('status')
-        if status:
-            order.status = status
-            order.save()
-            serializer = self.get_serializer(order)
-            return Response(serializer.data)
-        return Response(
-            {"error": "Status not provided"}, 
-            status=status.HTTP_400_BAD_REQUEST
-        )
+        new_status = request.data.get('status')
+        if new_status not in dict(Order.STATUS_CHOICES):
+            return Response(
+                {"error": "Invalid status provided"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        order.status = new_status
+        order.save()
+        serializer = self.get_serializer(order)
+        return Response(serializer.data)
 
-class UsageViewSet(viewsets.ModelViewSet):
-    queryset = Usage.objects.all()
-    serializer_class = UsageSerializer
+class DrugUsageViewSet(viewsets.ModelViewSet):
+    queryset = DrugUsage.objects.all()
+    serializer_class = DrugUsageSerializer
     filter_backends = [DjangoFilterBackend, filters.OrderingFilter]
-    filterset_fields = ['usage_type', 'date']
+    filterset_fields = ['usage_type', 'date', 'drug']
     ordering_fields = ['date', 'total_value']
 
-    def create(self, request, *args, **kwargs):
-        serializer = self.get_serializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
-        self.perform_create(serializer)
-        headers = self.get_success_headers(serializer.data)
-        return Response(serializer.data, status=status.HTTP_201_CREATED, headers=headers)
+    def get_queryset(self):
+        return DrugUsage.objects.select_related('drug')
 
     @action(detail=False, methods=['get'])
     def by_date_range(self, request):
@@ -113,24 +124,24 @@ class UsageViewSet(viewsets.ModelViewSet):
         
         if not start_date or not end_date:
             return Response(
-                {"error": "Both start_date and end_date are required"}, 
+                {"error": "Both start_date and end_date are required"},
                 status=status.HTTP_400_BAD_REQUEST
             )
         
-        usages = Usage.objects.filter(date__range=[start_date, end_date])
+        usages = self.get_queryset().filter(date__range=[start_date, end_date])
         serializer = self.get_serializer(usages, many=True)
         return Response(serializer.data)
 
-class NotificationViewSet(viewsets.ModelViewSet):
-    queryset = Notification.objects.all().order_by('-created_at')
-    serializer_class = NotificationSerializer
+class NotificationsViewSet(viewsets.ModelViewSet):
+    queryset = Notifications.objects.all()
+    serializer_class = NotificationsSerializer
     filter_backends = [DjangoFilterBackend]
     filterset_fields = ['is_read', 'notification_type']
     
     def get_queryset(self):
-        queryset = super().get_queryset()
+        queryset = Notifications.objects.select_related('drug')
         if self.action == 'list':
-            return queryset.filter(is_read=False)
+            return queryset.filter(is_read=False).order_by('-created_at')
         return queryset
 
     @action(detail=True, methods=['post'])
@@ -142,5 +153,36 @@ class NotificationViewSet(viewsets.ModelViewSet):
 
     @action(detail=False, methods=['post'])
     def mark_all_as_read(self, request):
-        Notification.objects.filter(is_read=False).update(is_read=True)
+        self.get_queryset().filter(is_read=False).update(is_read=True)
         return Response({'status': 'all notifications marked as read'})
+
+class OrderItemViewSet(viewsets.ModelViewSet):
+    serializer_class = OrderItemSerializer
+    filter_backends = [DjangoFilterBackend, filters.OrderingFilter]
+    filterset_fields = ['order', 'drug']
+    ordering_fields = ['quantity', 'price_per_unit', 'total_value']
+
+    def get_queryset(self):
+        return OrderItem.objects.select_related('order', 'drug')
+
+class PriceHistoryViewSet(viewsets.ReadOnlyModelViewSet):  # ReadOnly because price history shouldn't be modified directly
+    serializer_class = PriceHistorySerializer
+    filter_backends = [DjangoFilterBackend, filters.OrderingFilter]
+    filterset_fields = ['drug']
+    ordering_fields = ['date_changed']
+
+    def get_queryset(self):
+        return PriceHistory.objects.select_related('drug').order_by('-date_changed')
+
+    @action(detail=False, methods=['get'])
+    def by_drug(self, request):
+        drug_id = request.query_params.get('drug_id')
+        if not drug_id:
+            return Response(
+                {"error": "drug_id parameter is required"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        price_history = self.get_queryset().filter(drug_id=drug_id)
+        serializer = self.get_serializer(price_history, many=True)
+        return Response(serializer.data)
